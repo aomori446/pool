@@ -10,14 +10,11 @@ import (
 )
 
 var (
-	// ErrNoMoreJobs is a sentinel error used to signal the pool to shut down.
-	ErrNoMoreJobs = errors.New("no more jobs")
-
-	// ErrPoolClosed is an error indicating that a job was interrupted because the pool was shut down.
+	// ErrPoolClosed 表示任務因 pool 已關閉而被中斷。
 	ErrPoolClosed = errors.New("pool was closed during job execution")
 )
 
-// Job represents a unit of work to be executed.
+// Job 代表一個要執行的工作單元。
 type Job[R any] struct {
 	Execute func(ctx context.Context) (R, error)
 	Context context.Context
@@ -26,60 +23,50 @@ type Job[R any] struct {
 	Backoff time.Duration
 }
 
-// NoMoreJobsSignal creates a special job that signals the pool to stop accepting new jobs.
-func NoMoreJobsSignal[R any]() Job[R] {
-	return Job[R]{
-		Execute: func(ctx context.Context) (R, error) {
-			var zero R
-			return zero, ErrNoMoreJobs
-		},
-	}
-}
-
-// Result holds the value and a potential error from a completed job.
+// Result 保存已完成任務的回傳值和潛在錯誤。
 type Result[V any] struct {
 	Error error
 	Value V
 }
 
-// Stats holds metrics about the pool's performance.
+// Stats 保存 pool 的效能指標。
 type Stats struct {
 	Pending   int64
 	Completed int64
 	Failed    int64
 }
 
-// Pool manages a pool of workers for concurrent job execution.
+// Pool 管理一個用於併發執行任務的 worker pool。
 type Pool[R any] struct {
 	jobs    chan Job[R]
 	results chan Result[R]
 
-	closeOnce sync.Once
+	drainOnce sync.Once // 用於確保 Drain 只執行一次
+	closeOnce sync.Once // 用於確保 ShutdownNow 只執行一次
 	wg        sync.WaitGroup
-	done      chan struct{}
+	done      chan struct{} // 用於廣播 pool 關閉信號
 
 	mu           sync.Mutex
 	workers      int
-	workerCancel chan struct{}
+	workerCancel chan struct{} // 用於縮減 worker 數量
 
 	pendingJobs   atomic.Int64
 	completedJobs atomic.Int64
 	failedJobs    atomic.Int64
 }
 
-// NewPool creates and starts a new worker pool with an initial number of workers.
+// NewPool 創建並啟動一個新的 worker pool。
 func NewPool[R any](jobBufferSize int, initialWorkers int) *Pool[R] {
 	if jobBufferSize < 0 {
 		jobBufferSize = 0
 	}
-
 	if initialWorkers < 1 {
 		initialWorkers = 1
 	}
 
 	pool := &Pool[R]{
 		jobs:         make(chan Job[R], jobBufferSize),
-		results:      make(chan Result[R], initialWorkers),
+		results:      make(chan Result[R], jobBufferSize),
 		done:         make(chan struct{}),
 		workerCancel: make(chan struct{}),
 	}
@@ -94,9 +81,9 @@ func NewPool[R any](jobBufferSize int, initialWorkers int) *Pool[R] {
 	return pool
 }
 
+// worker 的職責是從佇列中接收任務，並交由 processJob 處理。
 func (p *Pool[R]) worker() {
 	defer p.wg.Done()
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for {
 		select {
@@ -108,68 +95,82 @@ func (p *Pool[R]) worker() {
 			if !ok {
 				return
 			}
-
-			func(job Job[R]) {
-				p.pendingJobs.Add(-1)
-
-				ctx := job.Context
-				if ctx == nil {
-					ctx = context.Background()
-				}
-
-				if job.Timeout > 0 {
-					var cancel context.CancelFunc
-					ctx, cancel = context.WithTimeout(ctx, job.Timeout)
-					defer cancel()
-				}
-
-				var val R
-				var err error
-
-			RetryLoop:
-				for i := 0; i <= job.Retries; i++ {
-					val, err = job.Execute(ctx)
-					if err == nil {
-						break
-					}
-					if i < job.Retries && job.Backoff > 0 {
-						backoffCeiling := job.Backoff * time.Duration(1<<i)
-						sleepTime := time.Duration(r.Intn(int(backoffCeiling)))
-						select {
-						case <-time.After(sleepTime):
-						case <-ctx.Done():
-							err = ctx.Err()
-							break RetryLoop
-						case <-p.done:
-							err = ErrPoolClosed
-							break RetryLoop
-						}
-					}
-				}
-
-				if errors.Is(err, ErrNoMoreJobs) {
-					p.Close()
-					return
-				}
-
-				if err == nil {
-					p.completedJobs.Add(1)
-				} else {
-					p.failedJobs.Add(1)
-				}
-
-				result := Result[R]{Error: err, Value: val}
-
-				select {
-				case p.results <- result:
-				case <-p.done:
-				}
-			}(job)
+			p.processJob(job)
 		}
 	}
 }
 
-// Resize dynamically changes the number of running workers.
+// processJob 負責處理單一任務的完整生命週期。
+func (p *Pool[R]) processJob(job Job[R]) {
+	p.pendingJobs.Add(-1)
+
+	ctx := job.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if job.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, job.Timeout)
+		defer cancel()
+	}
+
+	var val R
+	var err error
+
+RetryLoop:
+	for i := 0; i <= job.Retries; i++ {
+		val, err = job.Execute(ctx)
+		if err == nil {
+			break
+		}
+
+		if i < job.Retries && job.Backoff > 0 {
+			backoffCeiling := job.Backoff * time.Duration(1<<i)
+			sleepTime := time.Duration(rand.Intn(int(backoffCeiling)))
+			select {
+			case <-time.After(sleepTime):
+			case <-ctx.Done():
+				err = ctx.Err()
+				break RetryLoop
+			case <-p.done:
+				err = ErrPoolClosed
+				break RetryLoop
+			}
+		}
+	}
+
+	if err == nil {
+		p.completedJobs.Add(1)
+	} else {
+		p.failedJobs.Add(1)
+	}
+
+	select {
+	case p.results <- Result[R]{Error: err, Value: val}:
+	case <-p.done:
+	}
+}
+
+// Drain 優雅地關閉 worker pool。
+// 此方法會安全地關閉任務佇列，讓 worker 處理完所有已提交的任務後再停止。
+// 這是推薦的、標準的關閉方法，且可以安全地重複呼叫。
+func (p *Pool[R]) Drain() {
+	p.drainOnce.Do(func() {
+		close(p.jobs)
+	})
+}
+
+// ShutdownNow 立即強制關閉 worker pool。
+// 所有執行中的任務會被中斷，佇列中的任務會被拋棄。
+// 僅建議在緊急情況下使用，可以安全地重複呼叫。
+func (p *Pool[R]) ShutdownNow() {
+	p.closeOnce.Do(func() {
+		close(p.done)
+	})
+}
+
+// Resize 動態調整執行中 worker 的數量。
 func (p *Pool[R]) Resize(n int) {
 	if n < 0 {
 		n = 0
@@ -189,14 +190,14 @@ func (p *Pool[R]) Resize(n int) {
 	}
 }
 
-// Workers returns the current desired number of workers.
+// Workers 回傳當前設定的 worker 數量。
 func (p *Pool[R]) Workers() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.workers
 }
 
-// Stats returns a snapshot of the pool's current metrics.
+// Stats 回傳 pool 當前的各項指標快照。
 func (p *Pool[R]) Stats() Stats {
 	return Stats{
 		Pending:   p.pendingJobs.Load(),
@@ -205,19 +206,12 @@ func (p *Pool[R]) Stats() Stats {
 	}
 }
 
-// Close gracefully shuts down the worker pool.
-func (p *Pool[R]) Close() {
-	p.closeOnce.Do(func() {
-		close(p.done)
-	})
-}
-
-// Results returns the channel from which to consume job results.
+// Results 回傳用於接收任務結果的 channel。
 func (p *Pool[R]) Results() <-chan Result[R] {
 	return p.results
 }
 
-// Submit adds a job to the pool for execution.
+// Submit 提交一個任務到 pool 中執行。如果佇列已滿，此方法會阻塞。
 func (p *Pool[R]) Submit(job Job[R]) {
 	if job.Execute == nil {
 		return
@@ -227,5 +221,21 @@ func (p *Pool[R]) Submit(job Job[R]) {
 		return
 	case p.jobs <- job:
 		p.pendingJobs.Add(1)
+	}
+}
+
+// TrySubmit 嘗試提交一個任務，如果佇列已滿或 pool 已關閉則不阻塞並立即回傳 false。
+func (p *Pool[R]) TrySubmit(job Job[R]) bool {
+	if job.Execute == nil {
+		return false
+	}
+	select {
+	case <-p.done:
+		return false
+	case p.jobs <- job:
+		p.pendingJobs.Add(1)
+		return true
+	default:
+		return false
 	}
 }
