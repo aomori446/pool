@@ -26,8 +26,8 @@ type Job[R any] struct {
 	Backoff time.Duration
 }
 
-// NewNoMoreJobsSignal creates a special job that signals the pool to stop accepting new jobs.
-func NewNoMoreJobsSignal[R any]() Job[R] {
+// NoMoreJobsSignal creates a special job that signals the pool to stop accepting new jobs.
+func NoMoreJobsSignal[R any]() Job[R] {
 	return Job[R]{
 		Execute: func(ctx context.Context) (R, error) {
 			var zero R
