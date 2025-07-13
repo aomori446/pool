@@ -14,19 +14,10 @@ var ErrNoMoreJobs = errors.New("no more jobs")
 
 // Job represents a unit of work to be executed.
 type Job[R any] struct {
-	// Execute is the function that performs the work. It receives a context
-	// that can be used for cancellation.
 	Execute func(ctx context.Context) (R, error)
-	// Context is an optional, externally-provided context for this job.
-	// It's useful for cancellation signals that are not time-based.
 	Context context.Context
-	// Timeout is an optional duration for this specific job. If set, the job's
-	// context will be cancelled when the timeout is exceeded.
 	Timeout time.Duration
-	// Retries is the number of times to retry the job if it fails.
 	Retries int
-	// Backoff is the initial duration to wait before each retry.
-	// The actual wait time will increase exponentially with each attempt.
 	Backoff time.Duration
 }
 
@@ -108,62 +99,67 @@ func (p *Pool[R]) worker() {
 			if !ok {
 				return
 			}
-			p.pendingJobs.Add(-1)
 
-			var val R
-			var err error
+			// Wrap the job execution in an anonymous function to correctly
+			// manage the lifecycle of the timeout context.
+			func(job Job[R]) {
+				p.pendingJobs.Add(-1)
 
-			ctx := job.Context
-			if ctx == nil {
-				ctx = context.Background()
-			}
-
-			// If the user has set a timeout for the job, create a new context
-			// and ensure its cancel function is called.
-			if job.Timeout > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, job.Timeout)
-				defer cancel()
-			}
-
-		RetryLoop:
-			for i := 0; i <= job.Retries; i++ {
-				val, err = job.Execute(ctx)
-				if err == nil {
-					break
+				ctx := job.Context
+				if ctx == nil {
+					ctx = context.Background()
 				}
-				if i < job.Retries && job.Backoff > 0 {
-					backoffCeiling := job.Backoff * time.Duration(1<<i)
-					sleepTime := time.Duration(r.Intn(int(backoffCeiling)))
-					select {
-					case <-time.After(sleepTime):
-					case <-ctx.Done():
-						err = ctx.Err()
-						break RetryLoop
-					case <-p.done:
-						return
+
+				// This is the crucial fix: by creating the context inside this
+				// anonymous function, `defer cancel()` is now correctly scoped
+				// and will execute after this single job is processed.
+				if job.Timeout > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, job.Timeout)
+					defer cancel()
+				}
+
+				var val R
+				var err error
+
+			RetryLoop:
+				for i := 0; i <= job.Retries; i++ {
+					val, err = job.Execute(ctx)
+					if err == nil {
+						break
+					}
+					if i < job.Retries && job.Backoff > 0 {
+						backoffCeiling := job.Backoff * time.Duration(1<<i)
+						sleepTime := time.Duration(r.Intn(int(backoffCeiling)))
+						select {
+						case <-time.After(sleepTime):
+						case <-ctx.Done():
+							err = ctx.Err()
+							break RetryLoop
+						case <-p.done:
+							return
+						}
 					}
 				}
-			}
 
-			if errors.Is(err, ErrNoMoreJobs) {
-				p.Close()
-				continue
-			}
+				if errors.Is(err, ErrNoMoreJobs) {
+					p.Close()
+					return // Use return to exit the anonymous function
+				}
 
-			if err == nil {
-				p.completedJobs.Add(1)
-			} else {
-				p.failedJobs.Add(1)
-			}
+				if err == nil {
+					p.completedJobs.Add(1)
+				} else {
+					p.failedJobs.Add(1)
+				}
 
-			result := Result[R]{Error: err, Value: val}
+				result := Result[R]{Error: err, Value: val}
 
-			select {
-			case p.results <- result:
-			case <-p.done:
-				return
-			}
+				select {
+				case p.results <- result:
+				case <-p.done:
+				}
+			}(job)
 		}
 	}
 }
