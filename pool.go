@@ -9,11 +9,13 @@ import (
 	"time"
 )
 
-// ErrNoMoreJobs is a sentinel error used to signal the pool to shut down.
-var ErrNoMoreJobs = errors.New("no more jobs")
+var (
+	// ErrNoMoreJobs is a sentinel error used to signal the pool to shut down.
+	ErrNoMoreJobs = errors.New("no more jobs")
 
-// ErrPoolClosed is an error indicating that a job was interrupted because the pool was shut down.
-var ErrPoolClosed = errors.New("pool was closed during job execution")
+	// ErrPoolClosed is an error indicating that a job was interrupted because the pool was shut down.
+	ErrPoolClosed = errors.New("pool was closed during job execution")
+)
 
 // Job represents a unit of work to be executed.
 type Job[R any] struct {
@@ -69,6 +71,10 @@ type Pool[R any] struct {
 func NewPool[R any](jobBufferSize int, initialWorkers int) *Pool[R] {
 	if jobBufferSize < 0 {
 		jobBufferSize = 0
+	}
+
+	if initialWorkers < 1 {
+		initialWorkers = 1
 	}
 
 	pool := &Pool[R]{
@@ -135,9 +141,6 @@ func (p *Pool[R]) worker() {
 							err = ctx.Err()
 							break RetryLoop
 						case <-p.done:
-							// THE FIX: Don't return immediately.
-							// Instead, mark the job as failed due to shutdown
-							// and break the loop to allow stats to be recorded.
 							err = ErrPoolClosed
 							break RetryLoop
 						}
