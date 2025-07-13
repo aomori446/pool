@@ -12,6 +12,9 @@ import (
 // ErrNoMoreJobs is a sentinel error used to signal the pool to shut down.
 var ErrNoMoreJobs = errors.New("no more jobs")
 
+// ErrPoolClosed is an error indicating that a job was interrupted because the pool was shut down.
+var ErrPoolClosed = errors.New("pool was closed during job execution")
+
 // Job represents a unit of work to be executed.
 type Job[R any] struct {
 	Execute func(ctx context.Context) (R, error)
@@ -100,8 +103,6 @@ func (p *Pool[R]) worker() {
 				return
 			}
 
-			// Wrap the job execution in an anonymous function to correctly
-			// manage the lifecycle of the timeout context.
 			func(job Job[R]) {
 				p.pendingJobs.Add(-1)
 
@@ -110,9 +111,6 @@ func (p *Pool[R]) worker() {
 					ctx = context.Background()
 				}
 
-				// This is the crucial fix: by creating the context inside this
-				// anonymous function, `defer cancel()` is now correctly scoped
-				// and will execute after this single job is processed.
 				if job.Timeout > 0 {
 					var cancel context.CancelFunc
 					ctx, cancel = context.WithTimeout(ctx, job.Timeout)
@@ -137,14 +135,18 @@ func (p *Pool[R]) worker() {
 							err = ctx.Err()
 							break RetryLoop
 						case <-p.done:
-							return
+							// THE FIX: Don't return immediately.
+							// Instead, mark the job as failed due to shutdown
+							// and break the loop to allow stats to be recorded.
+							err = ErrPoolClosed
+							break RetryLoop
 						}
 					}
 				}
 
 				if errors.Is(err, ErrNoMoreJobs) {
 					p.Close()
-					return // Use return to exit the anonymous function
+					return
 				}
 
 				if err == nil {
