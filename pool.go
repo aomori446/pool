@@ -12,13 +12,17 @@ import (
 // ErrNoMoreJobs is a sentinel error used to signal the pool to shut down.
 var ErrNoMoreJobs = errors.New("no more jobs")
 
-// Job represents a unit of work to be executed, including retry logic and context.
+// Job represents a unit of work to be executed.
 type Job[R any] struct {
 	// Execute is the function that performs the work. It receives a context
 	// that can be used for cancellation.
 	Execute func(ctx context.Context) (R, error)
-	// Context is the context for this specific job. If nil, context.Background() will be used.
+	// Context is an optional, externally-provided context for this job.
+	// It's useful for cancellation signals that are not time-based.
 	Context context.Context
+	// Timeout is an optional duration for this specific job. If set, the job's
+	// context will be cancelled when the timeout is exceeded.
+	Timeout time.Duration
 	// Retries is the number of times to retry the job if it fails.
 	Retries int
 	// Backoff is the initial duration to wait before each retry.
@@ -50,8 +54,6 @@ type Stats struct {
 }
 
 // Pool manages a pool of workers for concurrent job execution.
-// It supports dynamic resizing, job retries with exponential backoff,
-// context cancellation, and provides metrics.
 type Pool[R any] struct {
 	jobs    chan Job[R]
 	results chan Result[R]
@@ -94,8 +96,6 @@ func NewPool[R any](jobBufferSize int, initialWorkers int) *Pool[R] {
 
 func (p *Pool[R]) worker() {
 	defer p.wg.Done()
-	// Create a seeded randomizer for each worker to ensure randomness
-	// and avoid lock contention on the global randomizer.
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for {
@@ -116,6 +116,14 @@ func (p *Pool[R]) worker() {
 			ctx := job.Context
 			if ctx == nil {
 				ctx = context.Background()
+			}
+
+			// If the user has set a timeout for the job, create a new context
+			// and ensure its cancel function is called.
+			if job.Timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, job.Timeout)
+				defer cancel()
 			}
 
 		RetryLoop:
