@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,12 @@ type lifecycle struct {
 	closeOnce sync.Once
 }
 
+type stats struct {
+	pending   atomic.Int64
+	completed atomic.Int64
+	failed    atomic.Int64
+}
+
 // Pool 是一個管理 worker goroutine 池的結構。
 // 其成員被組織到幾個內嵌結構中以提高可讀性。
 type Pool[R any] struct {
@@ -35,7 +42,7 @@ type Pool[R any] struct {
 
 	controller controller
 	lifecycle  lifecycle
-	stats      Stats
+	stats      stats
 }
 
 // NewPool 創建一個新的工作池。
@@ -207,7 +214,11 @@ func (p *Pool[R]) Workers() int {
 
 // Stats 返回工作池的當前統計數據。
 func (p *Pool[R]) Stats() Stats {
-	return p.stats
+	return Stats{
+		Pending:   p.stats.pending.Load(),
+		Completed: p.stats.completed.Load(),
+		Failed:    p.stats.failed.Load(),
+	}
 }
 
 // Results 返回一個唯讀的結果通道。
