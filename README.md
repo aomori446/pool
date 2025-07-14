@@ -23,4 +23,4 @@
 使用 `go get` 取得：
 
 ```bash
-go get github.com/aomori168/pool
+go get github.com/aomori168/pool@latest
