@@ -173,6 +173,10 @@ func (p *Pool[R]) Drain() {
 	})
 }
 
+func (p *Pool[R]) Closed() <-chan struct{} {
+	return p.lifecycle.done
+}
+
 // ShutdownNow 立即停止所有 worker 並關閉工作池。
 func (p *Pool[R]) ShutdownNow() {
 	p.lifecycle.closeOnce.Do(func() {
