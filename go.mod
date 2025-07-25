@@ -1,3 +1,3 @@
-module github.com/aomori168/pool
+module github.com/aomori446/pool
 
 go 1.24.4
